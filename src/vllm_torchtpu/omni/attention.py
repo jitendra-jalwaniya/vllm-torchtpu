@@ -19,11 +19,13 @@ sequence lengths. Masked, causal, or non-bf16 calls fall back with a
 one-time warning to ``TpuSDPAImpl`` (PyTorch SDPA).
 """
 
+import os
 from functools import cache as run_once
 from typing import Any
 
 import jax
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch_tpu._internal import pallas
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 
@@ -43,9 +45,19 @@ class TpuSDPAImpl(SDPAImpl):
         value: torch.Tensor,
         attn_metadata: Any | None = None,
     ) -> torch.Tensor:
-        return self._forward_impl(
-            query, key, value, attn_metadata, mask_mode="broadcast_k"
-        )
+        attn_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        if attn_mask is None or os.environ.get("VLLM_TORCHTPU_DEBUG_SDPA_MASK_DEFAULT") == "1":
+            return self._forward_impl(
+                query, key, value, attn_metadata, mask_mode="broadcast_k"
+            )
+        # torch_tpu's default SDPA lowering is wrong with any attn_mask
+        # (bool or float, (B, 1, 1, K)): max abs error ~2 against CPU, and
+        # sometimes NaN. The math backend is correct. LTX-2 under sequence
+        # parallelism sends key-padding masks here (padded audio tokens).
+        with sdpa_kernel(SDPBackend.MATH):
+            return self._forward_impl(
+                query, key, value, attn_metadata, mask_mode="broadcast_k"
+            )
 
 
 class TpuSDPABackend(SDPABackend):

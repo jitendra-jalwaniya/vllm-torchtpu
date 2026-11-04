@@ -79,11 +79,65 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_ffn_gelu_fence()
     _patch_diffusion_worker_d2h_stream()
     _patch_diffusion_startup_warmup_sync()
-    _patch_ltx2_split_rope()
+    # DEBUG(ltx23-nan): A/B switch for the split-RoPE patch (#2298).
+    import os
+
+    if os.environ.get("VLLM_TORCHTPU_DISABLE_LTX2_SPLIT_ROPE") != "1":
+        _patch_ltx2_split_rope()
+    else:
+        logger.warning("DEBUG: LTX-2 split RoPE patch disabled.")
     _patch_wan_fused_qk_norm_rope()
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    # DEBUG(ltx23-nan): opt-in NaN probe.
+    if os.environ.get("VLLM_TORCHTPU_LTX_NAN_PROBE") == "1":
+        from vllm_torchtpu.omni.ltx2_nan_probe import install as install_nan_probe
+
+        install_nan_probe()
+    # DEBUG(ltx23-nan): candidate fix, give all_gather an input that owns
+    # its storage instead of an offset view (CFG-parallel chunk(k) slots).
+    if os.environ.get("VLLM_TORCHTPU_DEBUG_GATHER_CLONE") == "1":
+        _debug_patch_all_gather_clone()
+    # DEBUG(ltx23-nan): log the audio padding mask each guidance phase sees.
+    if os.environ.get("VLLM_TORCHTPU_LTX_DEBUG_SHAPES") == "1":
+        _debug_patch_ltx_shapes()
+
+
+def _debug_patch_ltx_shapes() -> None:
+    from vllm_omni.diffusion.models.ltx2 import ltx2_guidance as g
+
+    orig = g.LTXGuidanceExecutor.prepare_denoise_context
+
+    def prepare_denoise_context(plan, guidance_parallel_ready, guidance_world_size, denoise_ctx):
+        out = orig(plan, guidance_parallel_ready, guidance_world_size, denoise_ctx)
+        mask = out.audio_attention_mask
+        logger.warning(
+            "DEBUG shapes: passes=%s audio_latents=%s audio_coords=%s audio_attention_mask=%s valid=%s",
+            plan.names,
+            tuple(out.audio_latents.shape),
+            tuple(out.audio_coords.shape),
+            None if mask is None else (tuple(mask.shape), mask.dtype, tuple(mask.stride())),
+            None if mask is None else int(mask[0].sum().item()),
+        )
+        return out
+
+    g.LTXGuidanceExecutor.prepare_denoise_context = staticmethod(prepare_denoise_context)
+
+
+def _debug_patch_all_gather_clone() -> None:
+    from vllm_omni.diffusion.distributed import group_coordinator as gc
+
+    orig_all_gather = gc.GroupCoordinator.all_gather
+
+    def all_gather(self, input_, dim=0, separate_tensors=False, group=None):
+        whole = input_.untyped_storage().nbytes() == input_.numel() * input_.element_size()
+        if input_.storage_offset() != 0 or not whole or not input_.is_contiguous():
+            input_ = input_.clone(memory_format=torch.contiguous_format)
+        return orig_all_gather(self, input_, dim, separate_tensors, group)
+
+    gc.GroupCoordinator.all_gather = all_gather
+    logger.warning("DEBUG: GroupCoordinator.all_gather clones view inputs.")
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
