@@ -84,6 +84,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_ltx2_per_batch_timestep()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -645,3 +646,55 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+_LTX2_PER_BATCH_TIMESTEP_PATCHED = "_tpu_ltx2_per_batch_timestep_patched"
+
+
+def _patch_ltx2_per_batch_timestep() -> None:
+    """Keep LTX-2 T2V timestep per-batch under sequence parallelism.
+
+    Upstream LTXRuntime._denoise_timestep_kwargs always passes
+    expand_for_sequence_parallel=True, expanding the scalar timestep to
+    (B, T_video) and (B, T_audio). Under c2u4 this projects and materializes
+    bf16[3072, 36864] -> [2, 1536, 9, 4096] (226 MB) and [2, 1536, 4, 4096]
+    (96 MB) in every block (19.7% of the step). For T2V (and I2V when
+    conditioning_mask is None), every token has the same timestep; passing it
+    per-batch (B,) keeps temb at (B, 1, 9, D) (144 KB) and broadcasts into
+    each block's norm modulation. When I2V has a conditioning_mask,
+    LTXConditioningMixin._denoise_timestep_kwargs still overrides video
+    timestep with the 2-D masked tensor.
+    """
+    from vllm_omni.diffusion.models.ltx2.ltx2_runtime import LTXRuntime
+
+    if getattr(
+        LTXRuntime._denoise_timestep_kwargs,
+        _LTX2_PER_BATCH_TIMESTEP_PATCHED,
+        False,
+    ):
+        return
+
+    def _per_batch_denoise_timestep_kwargs(
+        self: Any,
+        ts: torch.Tensor,
+        forward_ctx: Any,
+        denoise_ctx: Any,
+        *,
+        video_token_count: int,
+        audio_token_count: int,
+    ) -> dict[str, torch.Tensor]:
+        del forward_ctx, denoise_ctx
+        return self.guidance_executor.timestep_kwargs(
+            ts,
+            video_token_count,
+            audio_token_count,
+            expand_for_sequence_parallel=False,
+        )
+
+    setattr(
+        _per_batch_denoise_timestep_kwargs,
+        _LTX2_PER_BATCH_TIMESTEP_PATCHED,
+        True,
+    )
+    LTXRuntime._denoise_timestep_kwargs = _per_batch_denoise_timestep_kwargs
+    logger.info("Applied TPU patch: per-batch LTX-2 T2V timestep under SP.")
