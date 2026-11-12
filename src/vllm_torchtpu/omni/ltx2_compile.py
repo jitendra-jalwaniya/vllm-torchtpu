@@ -11,33 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU torch.compile support for LTX-2 / LTX-2.3 diffusion transformers.
+"""TPU torch.compile + layout/sync optimizations for LTX-2 / LTX-2.3 DiT.
 
 Compiles ONE shared ``LTX2VideoTransformerBlock`` graph across all 48 blocks
 with ``torch.compile(backend="tpu", fullgraph=True, dynamic=False)``, removing
 the ~263 ms/step eager Python/ATen dispatch floor while keeping cold compile
 latency low (reusing a single compiled callable across all homogeneous blocks).
 
-Key multi-rank SPMD invariants enforced for ``num_partitions=8`` PJRT execution:
-  1. Functional ``_c10d_functional`` collectives (``all_to_all_single`` and
-     ``all_gather_tensor``) replace ``SeqAllToAll4D`` autograd wrappers and
-     in-place collective buffers during compilation.
-  2. Rank-local head slicing in ``LTX2VideoToAudioParallelAttention`` uses a
-     rank-local device index tensor (``torch.index_select``) rather than Python
-     ``rank`` slice bounds so all 8 partitions emit identical HLO.
-  3. Guidance perturbation masks (STG block 28 and modality CFG) are populated
-     symmetrically across all CFG-parallel ranks (using ``1.0`` identity masks
-     on unperturbed slots) so all 8 partitions trace the same graph per block.
-  4. Sequence-sharded views (such as split-RoPE ``cos``/``sin`` slices and
-     per-step ``timestep`` scalars) are materialized to ``storage_offset == 0``
-     before entering compiled regions (with cached RoPE shard views) so
-     ``_guard_input_storage_offsets`` never triggers per-step recompilations or
-     cross-rank slice-offset divergence.
+Additional toggleable TPU optimizations on the stack branch:
+  * ``VLLM_TORCHTPU_LTX2_ASYNC_STEP=1`` (default): replaces CUDA-only blocking
+    ``current_omni_platform.synchronize()`` in
+    ``LTXRuntime._synchronize_guidance_parallel_step_output`` with non-blocking
+    ``synchronize_tensors(..., wait=False)``, eliminating 40 per-step host-device
+    pipeline drains.
+  * ``VLLM_TORCHTPU_LTX2_MXU_GATE=1`` (default): expands LTX-2.3 per-head gate
+    scalars ``(B, T, H) -> (B, T, H * D)`` via a bit-exact ``(H, H * D)`` MXU
+    indicator matmul instead of ``unflatten(2, (H, D)) * gates.unsqueeze(-1)``,
+    eliminating 12 synchronous 4D relayout copies per block.
 """
 
 from __future__ import annotations
 
 import functools
+import os
 import types
 from typing import Any
 
@@ -55,6 +51,8 @@ logger = init_logger(__name__)
 _LTX2_COMPILE_PATCHED = "_tpu_ltx2_compile_patched"
 _V2A_SP_PATCHED = "_tpu_v2a_sp_patched"
 _PERTURBATION_SYM_PATCHED = "_tpu_perturbation_sym_patched"
+_ASYNC_STEP_PATCHED = "_tpu_ltx2_async_step_patched"
+_MXU_GATE_PATCHED = "_tpu_ltx2_mxu_gate_patched"
 _V2A_HEAD_IDX_CACHE: dict[int, torch.Tensor] = {}
 _ROPE_KEYS = frozenset(
     {
@@ -64,6 +62,196 @@ _ROPE_KEYS = frozenset(
         "ca_audio_rotary_emb",
     }
 )
+
+
+def _build_gate_expand_matrix(
+    heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    cols = torch.arange(heads * head_dim, device=device) // head_dim
+    rows = torch.arange(heads, device=device).unsqueeze(1)
+    return (rows == cols.unsqueeze(0)).to(dtype=dtype)
+
+
+@functools.cache
+def _cached_gate_expand_matrix(
+    heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    return _build_gate_expand_matrix(heads, head_dim, dtype, device)
+
+
+def _patch_ltx2_async_guidance_step() -> None:
+    """Replace CUDA-only per-step device synchronize() with non-blocking flush."""
+    if os.environ.get("VLLM_TORCHTPU_LTX2_ASYNC_STEP", "1") == "0":
+        return
+
+    from vllm_omni.diffusion.distributed.parallel_state import (
+        get_guidance_parallel_world_size,
+    )
+    from vllm_omni.diffusion.models.ltx2.ltx2_runtime import LTXRuntime
+
+    if getattr(
+        LTXRuntime._synchronize_guidance_parallel_step_output,
+        _ASYNC_STEP_PATCHED,
+        False,
+    ):
+        return
+
+    def _async_guidance_step_output(
+        self: Any,
+        latents: tuple[torch.Tensor, torch.Tensor],
+        guidance_parallel_ready: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del self
+        if not (guidance_parallel_ready and get_guidance_parallel_world_size() > 1):
+            return latents
+        latents = tuple(tensor.contiguous() for tensor in latents)
+        synchronize_tensors(list(latents), wait=False)
+        return latents
+
+    setattr(_async_guidance_step_output, _ASYNC_STEP_PATCHED, True)
+    LTXRuntime._synchronize_guidance_parallel_step_output = _async_guidance_step_output
+    logger.info(
+        "Applied TPU patch: non-blocking async guidance-parallel step boundary."
+    )
+
+
+def _patch_ltx2_mxu_gated_attention() -> None:
+    """Expand LTX-2.3 per-head attention gates on MXU without 4D relayout copies."""
+    if os.environ.get("VLLM_TORCHTPU_LTX2_MXU_GATE", "1") == "0":
+        return
+
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+    from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
+
+    proc_cls = ltx2_transformer.LTX2AudioVideoAttnProcessor
+    if getattr(proc_cls.__call__, _MXU_GATE_PATCHED, False):
+        return
+
+    def _mxu_gated_attn_call(
+        self: Any,
+        attn: Any,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        query_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        key_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        perturbation_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        is_self_attention = encoder_hidden_states is None
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if is_self_attention else encoder_hidden_states.shape
+        )
+
+        attention_mask = self._prepare_attention_mask(
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=attention_mask,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+        )
+
+        gate_logits: torch.Tensor | None = None
+        if attn.to_gate_logits is not None:
+            gate_logits = attn.to_gate_logits(hidden_states)
+            if isinstance(gate_logits, tuple):
+                gate_logits = gate_logits[0]
+
+        if is_self_attention:
+            encoder_hidden_states = hidden_states
+
+        query, key, value = self._project_qkv(
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            is_self_attention=is_self_attention,
+        )
+
+        query = attn.norm_q(query).to(dtype=value.dtype)
+        key = attn.norm_k(key).to(dtype=value.dtype)
+
+        if query_rotary_emb is not None:
+            query_rotary_emb = self._slice_rope_for_tp(query_rotary_emb, attn)
+            if key_rotary_emb is not None:
+                key_rotary_emb = self._slice_rope_for_tp(key_rotary_emb, attn)
+            if attn.rope_type == "interleaved":
+                query = ltx2_transformer.apply_interleaved_rotary_emb(
+                    query, query_rotary_emb
+                )
+                key = ltx2_transformer.apply_interleaved_rotary_emb(
+                    key,
+                    key_rotary_emb if key_rotary_emb is not None else query_rotary_emb,
+                )
+            elif attn.rope_type == "split":
+                query = ltx2_transformer.apply_split_rotary_emb(
+                    query, query_rotary_emb, head_dim=attn.head_dim
+                )
+                key = ltx2_transformer.apply_split_rotary_emb(
+                    key,
+                    key_rotary_emb if key_rotary_emb is not None else query_rotary_emb,
+                    head_dim=attn.head_dim,
+                )
+
+        query = query.to(dtype=value.dtype)
+        key = key.to(dtype=value.dtype)
+
+        query = query.unflatten(2, (attn.heads, attn.head_dim))
+        key = key.unflatten(2, (attn.heads, attn.head_dim))
+        value_heads = value.unflatten(2, (attn.heads, attn.head_dim))
+
+        attn_metadata = (
+            AttentionMetadata(attn_mask=attention_mask)
+            if attention_mask is not None
+            else None
+        )
+        hidden_states = attn.attn(query, key, value_heads, attn_metadata)
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+        if perturbation_mask is not None:
+            hidden_states = hidden_states * perturbation_mask + value * (
+                1 - perturbation_mask
+            )
+
+        if gate_logits is not None:
+            gates = 2.0 * torch.sigmoid(gate_logits)
+            if hidden_states.dtype == torch.bfloat16 and gates.dtype == torch.bfloat16:
+                expand_mat = (
+                    _build_gate_expand_matrix(
+                        attn.heads,
+                        attn.head_dim,
+                        gates.dtype,
+                        hidden_states.device,
+                    )
+                    if torch.compiler.is_compiling()
+                    else _cached_gate_expand_matrix(
+                        attn.heads,
+                        attn.head_dim,
+                        gates.dtype,
+                        hidden_states.device,
+                    )
+                )
+                hidden_states = hidden_states * torch.matmul(gates, expand_mat)
+            else:
+                hidden_states = (
+                    hidden_states.unflatten(2, (attn.heads, attn.head_dim))
+                    * gates.unsqueeze(-1)
+                ).flatten(2, 3)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
+
+    setattr(_mxu_gated_attn_call, _MXU_GATE_PATCHED, True)
+    proc_cls.__call__ = _mxu_gated_attn_call
+    logger.info("Applied TPU patch: MXU channel-expanded LTX-2.3 gated attention.")
 
 
 def _functional_all_to_all_4d(
@@ -522,9 +710,12 @@ def _activate_ltx2_compile_runtime_hooks() -> None:
 
 
 def apply_ltx2_compile_patches() -> None:
-    """Register LTX-2 TPU setup_compile hook (active only when enforce_eager=False)."""
+    """Register LTX-2 TPU setup_compile hook and layout/sync patches."""
     from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2
     from vllm_omni.diffusion.worker import diffusion_model_runner
+
+    _patch_ltx2_async_guidance_step()
+    _patch_ltx2_mxu_gated_attention()
 
     if getattr(pipeline_ltx2.LTX2Pipeline, "_tpu_setup_compile_registered", False):
         return
@@ -539,8 +730,6 @@ def apply_ltx2_compile_patches() -> None:
     pipeline_ltx2.LTX2Pipeline.setup_compile = _ltx2_setup_compile
     pipeline_ltx2.LTX2Pipeline._tpu_setup_compile_registered = True  # type: ignore[attr-defined]
 
-    # Ensure DiffusionModelRunner._compile_transformer uses backend="tpu", dynamic=False
-    # instead of Inductor/CUDA-graph options if any non-LTX2 pipeline invokes it on TPU.
     runner_cls = diffusion_model_runner.DiffusionModelRunner
     if not getattr(runner_cls._compile_transformer, "_tpu_backend_patched", False):
         from vllm_omni.diffusion.compile import regionally_compile
@@ -569,4 +758,4 @@ def apply_ltx2_compile_patches() -> None:
         setattr(_tpu_compile_transformer, "_tpu_backend_patched", True)
         runner_cls._compile_transformer = _tpu_compile_transformer
 
-    logger.info("Applied TPU patch: LTX-2 shared block torch.compile setup.")
+    logger.info("Applied TPU patch: LTX-2 shared block torch.compile + stack setup.")

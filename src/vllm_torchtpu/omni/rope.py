@@ -33,6 +33,7 @@ tokens) this cuts ~7 ms per transformer layer (80.8 -> 73.9 ms).
 """
 
 import functools
+import os
 from functools import cache as run_once
 
 import jax
@@ -40,6 +41,8 @@ import torch
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.diffusion_attention.qk_norm_rope import qk_norm_rope
+
+_USE_MXU_SPLIT_ROPE = os.environ.get("VLLM_TORCHTPU_LTX2_MXU_ROPE", "1") != "0"
 
 
 @functools.cache
@@ -91,6 +94,30 @@ def _first_half_lanes(width: int, head_dim: int, device: torch.device) -> torch.
     return torch.arange(width, device=device) % head_dim < head_dim // 2
 
 
+def _build_half_swap_perm(
+    block_dim: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build block-diagonal ``(block_dim, block_dim)`` half-swap permutation on ``device``."""
+    half = head_dim // 2
+    idx = torch.arange(block_dim, device=device)
+    in_head = idx % head_dim
+    swapped_idx = (idx - in_head) + ((in_head + half) % head_dim)
+    return (idx.unsqueeze(1) == swapped_idx.unsqueeze(0)).to(dtype=dtype)
+
+
+@functools.cache
+def _half_swap_matrix(
+    block_dim: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    return _build_half_swap_perm(block_dim, head_dim, dtype, device)
+
+
 def split_rope_natural_tables(
     cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -118,21 +145,33 @@ def apply_split_rotary_half_swap(
 ) -> torch.Tensor:
     """Split RoPE of ``x`` (B, T, H * D) with ``split_rope_natural_tables`` tables.
 
-    Rolling the channels by -D/2 and +D/2 and selecting per lane puts each
-    head's other half under every entry, so with the signed sine table
-    ``out[j] = x[j] cos[j] - x[j + D/2] sin[j]`` and
-    ``out[j + D/2] = x[j + D/2] cos[j] + x[j] sin[j]`` stay elementwise on
-    q/k's own (B, T, H * D) layout, with no per-head reshape. As in
-    vLLM-Omni's ``apply_split_rotary_emb``, the products and the sum are
-    taken in the promoted dtype of ``x`` and the tables (``addcmul_``); the
-    result is rounded to ``x.dtype`` once, where vLLM-Omni's attention
-    processor casts it.
+    For ``torch.bfloat16`` inputs, swaps each head's two halves via a 128-lane
+    aligned ``(128, 128)`` block-diagonal MXU permutation matmul (1 head per
+    block when ``D == 128``, 2 heads packed per block when ``D == 64``), avoiding
+    unaligned ``x.roll(±D/2, dims=-1)`` slices and ``ConcatBitcast`` custom calls
+    while remaining bit-exact (one ``1.0`` entry per column).
     """
+    width = x.shape[-1]
+    if _USE_MXU_SPLIT_ROPE and x.dtype == torch.bfloat16:
+        block_dim = (
+            128
+            if (head_dim < 128 and 128 % head_dim == 0 and width % 128 == 0)
+            else head_dim
+        )
+        perm = (
+            _build_half_swap_perm(block_dim, head_dim, x.dtype, x.device)
+            if torch.compiler.is_compiling()
+            else _half_swap_matrix(block_dim, head_dim, x.dtype, x.device)
+        )
+        swapped = torch.matmul(x.reshape(-1, block_dim), perm).reshape(x.shape)
+        out = torch.addcmul(x * cos.squeeze(1), swapped, sin.squeeze(1))
+        return out.to(x.dtype)
+
     half = head_dim // 2
     lanes = (
-        torch.arange(x.shape[-1], device=x.device) % head_dim < half
+        torch.arange(width, device=x.device) % head_dim < half
         if torch.compiler.is_compiling()
-        else _first_half_lanes(x.shape[-1], head_dim, x.device)
+        else _first_half_lanes(width, head_dim, x.device)
     )
     swapped = torch.where(
         lanes,
