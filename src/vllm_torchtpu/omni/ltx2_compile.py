@@ -488,7 +488,7 @@ def _activate_ltx2_compile_runtime_hooks() -> None:
         if to_sync:
             synchronize_tensors(to_sync, wait=False)
 
-        return orig_model_forward(
+        res = orig_model_forward(
             self,
             hidden_states,
             audio_hidden_states,
@@ -501,6 +501,21 @@ def _activate_ltx2_compile_runtime_hooks() -> None:
             audio_sigma=audio_sigma,
             **kwargs,
         )
+        # Flush the post-block ulysses_pg SequenceParallelOutput lazy bucket before
+        # LTXGuidanceExecutor enqueues its cfg_pg all_gather_into_tensor, preventing
+        # DEFER_AND_FUSE from merging two incompatible subgroup device_assignments
+        # ([0,1,4,5,6,7,2,3] vs [0,6,1,7,4,2,5,3] in device_assignment_pipeline.cc:160).
+        out_tensors: list[torch.Tensor] = []
+        if isinstance(res, tuple):
+            out_tensors = [t for t in res if isinstance(t, torch.Tensor)]
+        else:
+            for attr in ("sample", "audio_sample"):
+                t = getattr(res, attr, None)
+                if isinstance(t, torch.Tensor):
+                    out_tensors.append(t)
+        if out_tensors:
+            synchronize_tensors(out_tensors, wait=False)
+        return res
 
     setattr(_fresh_ltx2_forward, _LTX2_COMPILE_PATCHED, True)
     model_cls.forward = _fresh_ltx2_forward
