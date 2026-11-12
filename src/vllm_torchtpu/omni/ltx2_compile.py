@@ -91,7 +91,7 @@ def _patch_ltx2_async_guidance_step() -> None:
         return
 
     from vllm_omni.diffusion.distributed.parallel_state import (
-        get_guidance_parallel_world_size,
+        get_classifier_free_guidance_world_size as get_guidance_parallel_world_size,
     )
     from vllm_omni.diffusion.models.ltx2.ltx2_runtime import LTXRuntime
 
