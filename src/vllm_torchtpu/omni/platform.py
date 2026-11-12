@@ -76,7 +76,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def supports_torch_inductor(cls) -> bool:
-        return False
+        return True
 
     @classmethod
     def supports_diffusion_dense_flash_attention(cls) -> bool:
