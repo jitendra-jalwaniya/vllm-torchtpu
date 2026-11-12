@@ -85,6 +85,9 @@ def apply_omni_model_specific_patches() -> None:
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
     _patch_ltx2_per_batch_timestep()
+    from vllm_torchtpu.omni.ltx2_compile import apply_ltx2_compile_patches
+
+    apply_ltx2_compile_patches()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -645,8 +648,12 @@ def _patch_ltx2_split_rope() -> None:
             start = ltx2_transformer.get_tensor_model_parallel_rank() * width
             cos = cos[..., start : start + width]
             sin = sin[..., start : start + width]
-        cos_ptr = cos.untyped_storage().data_ptr()
-        sin_ptr = sin.untyped_storage().data_ptr()
+        if not torch.compiler.is_compiling():
+            cos_ptr = cos.untyped_storage().data_ptr()
+            sin_ptr = sin.untyped_storage().data_ptr()
+        else:
+            cos_ptr = 0
+            sin_ptr = 0
         if cos_ptr != 0 and sin_ptr != 0:
             shard_key = (
                 cos_ptr,
