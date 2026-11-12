@@ -85,6 +85,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
     _patch_ltx2_per_batch_timestep()
+    _patch_ltx2_video_vae_decode()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -645,8 +646,12 @@ def _patch_ltx2_split_rope() -> None:
             start = ltx2_transformer.get_tensor_model_parallel_rank() * width
             cos = cos[..., start : start + width]
             sin = sin[..., start : start + width]
-        cos_ptr = cos.untyped_storage().data_ptr()
-        sin_ptr = sin.untyped_storage().data_ptr()
+        if not torch.compiler.is_compiling():
+            cos_ptr = cos.untyped_storage().data_ptr()
+            sin_ptr = sin.untyped_storage().data_ptr()
+        else:
+            cos_ptr = 0
+            sin_ptr = 0
         if cos_ptr != 0 and sin_ptr != 0:
             shard_key = (
                 cos_ptr,
@@ -739,3 +744,163 @@ def _patch_ltx2_per_batch_timestep() -> None:
     )
     LTXRuntime._denoise_timestep_kwargs = _per_batch_denoise_timestep_kwargs
     logger.info("Applied TPU patch: per-batch LTX-2 T2V timestep under SP.")
+
+
+_LTX2_VIDEO_VAE_DECODE_PATCHED = "_tpu_ltx2_video_vae_decode_patched"
+
+
+def _patch_ltx2_video_vae_decode() -> None:
+    """Optimize and compile LTX-2 Video VAE 3D decoder on TPU.
+
+    Upstream LTX2VideoUpsampler3d.forward separately permutes and 3x-flattens
+    the 8-D residual tensor, calls .repeat(1, 4, 1, 1, 1) (materializing a 4x
+    larger 761 MB tensor in up_blocks[2]), and adds it after a second 8-D
+    permute of conv_out. Because addition commutes with permutation and
+    slicing, adding the unrepeated residual via broadcast before the 8-D
+    permute eliminates the second 8-D permute, the 4x .repeat() allocation, and
+    the post-permute 761 MB add while remaining bit-exact. Combining this with
+    rsqrt PerChannelRMSNorm, single-reshape unpatchify, and full-graph
+    torch.compile(backend="tpu", dynamic=False) on LTX2VideoDecoder3d fuses the
+    ResNet3D/upsampler stages on rank 0.
+    """
+    import os
+
+    from diffusers.models.autoencoders import autoencoder_kl_ltx2
+
+    decoder_cls = autoencoder_kl_ltx2.LTX2VideoDecoder3d
+    upsampler_cls = autoencoder_kl_ltx2.LTX2VideoUpsampler3d
+    rms_norm_cls = autoencoder_kl_ltx2.PerChannelRMSNorm
+    if getattr(decoder_cls.forward, _LTX2_VIDEO_VAE_DECODE_PATCHED, False):
+        return
+
+    def _per_channel_rms_norm_forward(
+        self: Any,
+        x: torch.Tensor,
+        channel_dim: int | None = None,
+    ) -> torch.Tensor:
+        dim = self.channel_dim if channel_dim is None else channel_dim
+        mean_sq = torch.mean(x * x, dim=dim, keepdim=True)
+        return x * torch.rsqrt(mean_sq + self.eps)
+
+    def _upsampler_forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        causal: bool = True,
+    ) -> torch.Tensor:
+        batch_size, _, num_frames, height, width = hidden_states.shape
+        s0, s1, s2 = self.stride
+        conv_out = self.conv(hidden_states, causal=causal)
+        if self.residual:
+            repeats = (s0 * s1 * s2) // self.upscale_factor
+            c_base = hidden_states.shape[1] // (s0 * s1 * s2)
+            conv_out = (
+                conv_out.reshape(
+                    batch_size,
+                    repeats,
+                    c_base,
+                    s0,
+                    s1,
+                    s2,
+                    num_frames,
+                    height,
+                    width,
+                )
+                + hidden_states.reshape(
+                    batch_size,
+                    1,
+                    c_base,
+                    s0,
+                    s1,
+                    s2,
+                    num_frames,
+                    height,
+                    width,
+                )
+            ).reshape(
+                batch_size,
+                repeats * c_base,
+                s0,
+                s1,
+                s2,
+                num_frames,
+                height,
+                width,
+            )
+        else:
+            conv_out = conv_out.reshape(
+                batch_size, -1, s0, s1, s2, num_frames, height, width
+            )
+        hidden_states = conv_out.permute(0, 1, 5, 2, 6, 3, 7, 4).reshape(
+            batch_size, -1, num_frames * s0, height * s1, width * s2
+        )[:, :, s0 - 1 :]
+        return hidden_states
+
+    def _decoder_forward_impl(
+        self: Any,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor | None = None,
+        causal: bool | None = None,
+    ) -> torch.Tensor:
+        causal_flag = bool(causal or self.is_causal)
+        hidden_states = self.conv_in(hidden_states, causal=causal_flag)
+        if self.timestep_scale_multiplier is not None and temb is not None:
+            temb = temb * self.timestep_scale_multiplier
+        hidden_states = self.mid_block(hidden_states, temb, causal=causal_flag)
+        for up_block in self.up_blocks:
+            hidden_states = up_block(hidden_states, temb, causal=causal_flag)
+        hidden_states = self.norm_out(hidden_states)
+        if self.time_embedder is not None and temb is not None:
+            temb = self.time_embedder(
+                timestep=temb.flatten(),
+                resolution=None,
+                aspect_ratio=None,
+                batch_size=hidden_states.size(0),
+                hidden_dtype=hidden_states.dtype,
+            )
+            temb = temb.view(hidden_states.size(0), -1, 1, 1, 1).unflatten(
+                1, (2, -1)
+            )
+            temb = temb + self.scale_shift_table[None, ..., None, None, None]
+            shift, scale = temb.unbind(dim=1)
+            hidden_states = hidden_states * (1 + scale) + shift
+        hidden_states = self.conv_act(hidden_states)
+        hidden_states = self.conv_out(hidden_states, causal=causal_flag)
+        p = self.patch_size
+        p_t = self.patch_size_t
+        batch_size, _, num_frames, height, width = hidden_states.shape
+        hidden_states = hidden_states.reshape(
+            batch_size, -1, p_t, p, p, num_frames, height, width
+        )
+        hidden_states = hidden_states.permute(0, 1, 5, 2, 6, 4, 7, 3).reshape(
+            batch_size, -1, num_frames * p_t, height * p, width * p
+        )
+        return hidden_states
+
+    def _decoder_forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor | None = None,
+        causal: bool | None = None,
+    ) -> torch.Tensor:
+        if (
+            os.environ.get("VLLM_TORCHTPU_COMPILE_VAE_DECODER", "1") != "0"
+            and not torch.compiler.is_compiling()
+        ):
+            compiled = getattr(self, "_tpu_compiled_decoder_fn", None)
+            if compiled is None:
+                compiled = torch.compile(
+                    _decoder_forward_impl,
+                    backend="tpu",
+                    dynamic=False,
+                )
+                self._tpu_compiled_decoder_fn = compiled
+            return compiled(self, hidden_states, temb, causal)
+        return _decoder_forward_impl(self, hidden_states, temb, causal)
+
+    setattr(_decoder_forward, _LTX2_VIDEO_VAE_DECODE_PATCHED, True)
+    rms_norm_cls.forward = _per_channel_rms_norm_forward
+    upsampler_cls.forward = _upsampler_forward
+    decoder_cls.forward = _decoder_forward
+    logger.info(
+        "Applied TPU patch: pre-permute LTX-2 VAE upsampler residual and compiled decoder."
+    )
