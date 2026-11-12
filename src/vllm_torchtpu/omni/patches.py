@@ -765,9 +765,15 @@ def _patch_ltx2_guidance_sigma_scalar() -> None:
     ltx2_audio_runtime.py:513,609) eliminates all 80 D2H host syncs across the
     40-step denoise loop while keeping the exact same IEEE-754 float32 scalar.
     """
-    from vllm_omni.diffusion.models.ltx2 import ltx2_denoise, ltx2_guidance
+    from torch_tpu.tpu import synchronize_tensors
+    from vllm_omni.diffusion.models.ltx2 import (
+        ltx2_denoise,
+        ltx2_guidance,
+        ltx2_runtime,
+    )
 
     executor_cls = ltx2_guidance.LTXGuidanceExecutor
+    runtime_cls = ltx2_runtime.LTXRuntime
     if getattr(
         executor_cls.predict_noise,
         _LTX2_GUIDANCE_SIGMA_SCALAR_PATCHED,
@@ -877,6 +883,16 @@ def _patch_ltx2_guidance_sigma_scalar() -> None:
             rescale_token_count=rescale_token_count,
         )
 
+    def _nonblocking_sync_guidance_step_output(
+        self: Any,
+        latents: tuple[torch.Tensor, torch.Tensor],
+        guidance_parallel_ready: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del guidance_parallel_ready
+        if not torch.compiler.is_compiling():
+            synchronize_tensors(list(latents), wait=False)
+        return latents
+
     setattr(
         _predict_noise_with_cached_sigma,
         _LTX2_GUIDANCE_SIGMA_SCALAR_PATCHED,
@@ -885,6 +901,9 @@ def _patch_ltx2_guidance_sigma_scalar() -> None:
     ltx2_denoise.prepare_scheduler_stage = _cached_prepare_scheduler_stage
     executor_cls.predict_noise = _predict_noise_with_cached_sigma
     executor_cls._guide_modality = _guide_modality_with_cached_sigma
+    runtime_cls._synchronize_guidance_parallel_step_output = (
+        _nonblocking_sync_guidance_step_output
+    )
     logger.info(
-        "Applied TPU patch: pre-materialized LTX-2 guidance sigma scalars on CPU."
+        "Applied TPU patch: pre-materialized LTX-2 guidance sigma scalars and non-blocking step flush."
     )
