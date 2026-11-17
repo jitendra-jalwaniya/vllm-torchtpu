@@ -24,6 +24,7 @@ pytestmark = pytest.mark.omni
 
 _UPSTREAM_BUILD_PERTURBATION = ltx2_guidance.build_perturbation_kwargs
 _UPSTREAM_PREDICT_PARALLEL = ltx2_guidance.LTXGuidanceExecutor.predict_parallel_guidance
+_UPSTREAM_ATTN_PROC_CALL = ltx2_transformer.LTX2AudioVideoAttnProcessor.__call__
 
 
 @pytest.fixture
@@ -260,3 +261,62 @@ def test_fresh_ltx2_forward_flushes_outputs(monkeypatch, sync_log):
     assert len(sync_log) == 2
     assert len(sync_log[0][0]) == 3 and sync_log[0][1] is False
     assert len(sync_log[1][0]) == 2 and sync_log[1][1] is False
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("use_gates", [True, False])
+def test_mxu_gated_attention_matches_upstream(monkeypatch, dtype, use_gates):
+    monkeypatch.setattr(
+        ltx2_transformer.LTX2AudioVideoAttnProcessor,
+        "__call__",
+        _UPSTREAM_ATTN_PROC_CALL,
+    )
+    ltx2_compile._patch_ltx2_mxu_gated_attention()
+    ltx2_compile._patch_ltx2_mxu_gated_attention()  # idempotent
+
+    torch.manual_seed(0)
+    heads, head_dim = 4, 8
+    dim = heads * head_dim
+    gate_proj = torch.nn.Linear(dim, heads).to(dtype=dtype) if use_gates else None
+    q_proj = torch.nn.Linear(dim, dim, bias=False).to(dtype=dtype)
+    k_proj = torch.nn.Linear(dim, dim, bias=False).to(dtype=dtype)
+    v_proj = torch.nn.Linear(dim, dim, bias=False).to(dtype=dtype)
+    out_proj = torch.nn.Linear(dim, dim, bias=False).to(dtype=dtype)
+
+    class _StubAttn(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.heads = heads
+            self.head_dim = head_dim
+            self.rope_type = "split"
+            self.to_gate_logits = gate_proj
+            self.norm_q = torch.nn.Identity()
+            self.norm_k = torch.nn.Identity()
+            self.to_out = torch.nn.ModuleList([out_proj, torch.nn.Identity()])
+            self.attn = lambda q, k, v, meta=None: (q + k + v) * 0.25
+
+    proc = ltx2_transformer.LTX2AudioVideoAttnProcessor()
+    monkeypatch.setattr(
+        proc,
+        "_prepare_attention_mask",
+        lambda **kw: kw["attention_mask"],
+    )
+    monkeypatch.setattr(
+        proc,
+        "_project_qkv",
+        lambda attn, hidden_states, encoder_hidden_states, is_self_attention: (
+            q_proj(hidden_states),
+            k_proj(encoder_hidden_states),
+            v_proj(encoder_hidden_states),
+        ),
+    )
+
+    attn_mod = _StubAttn()
+    hs = torch.randn(2, 6, dim, dtype=dtype)
+    pmask = torch.tensor([[[1.0]], [[0.0]]], dtype=dtype)
+
+    got = proc(attn_mod, hs, perturbation_mask=pmask)
+    want = _UPSTREAM_ATTN_PROC_CALL(proc, attn_mod, hs, perturbation_mask=pmask)
+    assert got.dtype == dtype
+    # One 1.0 entry per column in expand_mat makes bf16 indicator matmul bit-exact.
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
