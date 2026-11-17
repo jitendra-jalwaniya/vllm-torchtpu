@@ -15,8 +15,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm_omni.diffusion.distributed import comm
-from vllm_omni.diffusion.models.ltx2 import ltx2_guidance
+from vllm_omni.diffusion.distributed import comm, parallel_state
+from vllm_omni.diffusion.models.ltx2 import ltx2_guidance, ltx2_transformer
 
 from vllm_torchtpu.omni import ltx2_compile
 
@@ -159,3 +159,104 @@ def test_symmetric_perturbation_masks_across_cfg_ranks(monkeypatch, sync_log):
     ):
         assert kw[key].shape == (2, 1, 1)
         assert torch.all(kw[key] == 1.0)
+
+
+def test_ensure_zero_offset_and_rope_cache(sync_log):
+    full = torch.randn(2, 1, 8, 16)
+    assert ltx2_compile._ensure_zero_offset(full) is full
+    assert len(sync_log) == 0
+
+    cache = {}
+    view0 = full[:, :, 0:4, :]
+    view1 = full[:, :, 4:8, :]
+    m0 = ltx2_compile._ensure_zero_offset(view0, cache)
+    assert m0.is_contiguous() and m0.storage_offset() == 0
+    torch.testing.assert_close(m0, view0, rtol=0, atol=0)
+    assert ltx2_compile._ensure_zero_offset(full[:, :, 0:4, :], cache) is m0
+    assert len(sync_log) == 1
+
+    m1 = ltx2_compile._ensure_zero_offset(view1, cache)
+    assert m1.storage_offset() == 0
+    torch.testing.assert_close(m1, view1, rtol=0, atol=0)
+    assert len(sync_log) == 2
+
+
+def test_shared_block_compile_binds_one_graph_across_blocks(monkeypatch, sync_log):
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 1)
+
+    compile_calls = []
+
+    def fake_compile(backend, fullgraph, dynamic):
+        compile_calls.append((backend, fullgraph, dynamic))
+        return lambda fn: fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    class _ToyBlock(torch.nn.Module):
+        def __init__(self, scale: float) -> None:
+            super().__init__()
+            self.lin = torch.nn.Linear(4, 4, bias=False)
+            with torch.no_grad():
+                self.lin.weight.copy_(torch.eye(4) * scale)
+
+        def forward(self, hs, ahs, ehs, aehs, **kwargs):
+            del ehs, aehs, kwargs
+            return self.lin(hs), ahs + 1.0
+
+    class _ToyTransformer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(
+                num_attention_heads=2,
+                attention_head_dim=4,
+                audio_num_attention_heads=2,
+                audio_attention_head_dim=4,
+            )
+            self.transformer_blocks = torch.nn.ModuleList(
+                [_ToyBlock(2.0), _ToyBlock(3.0), _ToyBlock(5.0)]
+            )
+
+    model = _ToyTransformer()
+    ltx2_compile._install_shared_block_compile(model)
+    ltx2_compile._install_shared_block_compile(model)  # idempotent
+    assert compile_calls == [("tpu", True, False)]
+
+    x = torch.ones(1, 2, 4)
+    a = torch.zeros(1, 2, 4)
+    e = torch.zeros(1, 2, 4)
+    for blk in model.transformer_blocks:
+        x, a = blk(x, a, e, e)
+    torch.testing.assert_close(x, torch.full((1, 2, 4), 30.0))
+    torch.testing.assert_close(a, torch.full((1, 2, 4), 3.0))
+
+
+def test_fresh_ltx2_forward_flushes_outputs(monkeypatch, sync_log):
+    monkeypatch.setattr(ltx2_compile, "_patch_ltx2_traceable_collectives", lambda: None)
+    monkeypatch.setattr(
+        ltx2_compile, "_patch_ltx2_symmetric_perturbation_masks", lambda: None
+    )
+    monkeypatch.setattr(
+        ltx2_transformer.LTX2VideoTransformer3DModel,
+        "forward",
+        lambda self, *args, **kwargs: (
+            torch.ones(1, 4),
+            torch.ones(1, 2),
+        ),
+    )
+
+    ltx2_compile._activate_ltx2_compile_runtime_hooks()
+    dummy = object.__new__(ltx2_transformer.LTX2VideoTransformer3DModel)
+    got = ltx2_transformer.LTX2VideoTransformer3DModel.forward(
+        dummy,
+        torch.zeros(1, 4),
+        torch.zeros(1, 2),
+        torch.zeros(1, 4),
+        torch.zeros(1, 2),
+        torch.tensor([500.0]),
+        torch.tensor([500.0]),
+        sigma=torch.tensor([0.5]),
+    )
+    assert len(got) == 2
+    assert len(sync_log) == 2
+    assert len(sync_log[0][0]) == 3 and sync_log[0][1] is False
+    assert len(sync_log[1][0]) == 2 and sync_log[1][1] is False

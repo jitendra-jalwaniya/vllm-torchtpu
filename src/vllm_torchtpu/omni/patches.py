@@ -91,6 +91,9 @@ def apply_omni_model_specific_patches() -> None:
     from vllm_torchtpu.omni.ltx2_vae import apply_ltx2_video_vae_patches
 
     apply_ltx2_video_vae_patches()
+    from vllm_torchtpu.omni.ltx2_compile import apply_ltx2_compile_patches
+
+    apply_ltx2_compile_patches()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:

@@ -110,7 +110,7 @@ def test_platform_attributes():
     assert platform.device_name == "tpu"
     assert platform.device_type == "tpu"
     assert platform.dist_backend == "gloo"
-    assert platform.supports_torch_inductor() is False
+    assert platform.supports_torch_inductor() is True
     assert platform.supports_diffusion_dense_flash_attention() is False
     assert (
         platform.get_diffusion_attn_backend_cls(None, 64)
